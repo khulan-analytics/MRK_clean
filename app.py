@@ -1,122 +1,96 @@
-    x=scenario_table["Scenario"],
-    y=scenario_table["Intrinsic Value / Share"],
-    text=scenario_table["Intrinsic Value / Share"].map(money),
-    textposition="outside",
-    name="Scenario value",
-))
-if np.isfinite(price):
-    scenario_chart.add_hline(y=price, line_dash="dash", annotation_text=f"Market price: {money(price)}")
-scenario_chart.update_layout(
-    title="Bull / Base / Bear valuation",
-    yaxis_title="Intrinsic value per share ($)",
-    showlegend=False,
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import yfinance as yf
+from packaging.version import Version
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ============================================================
+# APP SETUP
+# ============================================================
+TICKER = "MRK"
+
+st.set_page_config(
+    page_title="Merck & Co., Inc. (MRK) Equity Valuation Lab",
+    page_icon="📈",
+    layout="wide",
 )
-show_chart(scenario_chart)
-st.caption(
-    "The scenario presets are illustrative assumptions, not forecasts. The Base preset is fixed "
-    "(6% growth, 2.5% terminal growth) and may differ from your custom Part 2 assumptions; "
-    "the Part 2 (custom) row shows them side by side."
+
+st.title("Merck & Co., Inc. (MRK) Equity Valuation Lab")
+st.caption("Created by Khulan Ganzorig | MS in Business Analytics, University at Buffalo")
+st.markdown(
+    "An equity research project covering financial statement analysis, DCF valuation, "
+    "comparable company analysis, sensitivity analysis, and scenario modeling."
 )
-
-# ============================================================
-# VALUATION FOOTBALL FIELD
-# ============================================================
-st.subheader("Valuation football field")
-
-def scenario_value_of(name):
-    row = scenario_table.loc[scenario_table["Scenario"] == name, "Intrinsic Value / Share"]
-    return number(row.iloc[0]) if not row.empty else np.nan
-
-
-field = []
-bear_value = scenario_value_of("Bear")
-bull_value = scenario_value_of("Bull")
-base_scenario_value = scenario_value_of("Base")
-if np.isfinite(bear_value) and np.isfinite(bull_value):
-    field.append({
-        "Method": "DCF (Bear to Bull)",
-        "Low": min(bear_value, bull_value),
-        "High": max(bear_value, bull_value),
-        "Mid": base_scenario_value,
-    })
-
-for row in comp_ranges:
-    mid = number(row["Mid"])
-    low = number(row["Low"])
-    high = number(row["High"])
-    if not np.isfinite(mid) or mid <= 0:
-        continue
-    if not np.isfinite(low) or not np.isfinite(high) or low <= 0 or high <= 0:
-        low = high = mid
-    field.append({
-        "Method": f"Comps: {row['Method']}",
-        "Low": min(low, high),
-        "High": max(low, high),
-        "Mid": mid,
-    })
-
-low_52 = number(info.get("fiftyTwoWeekLow"))
-high_52 = number(info.get("fiftyTwoWeekHigh"))
-if np.isfinite(low_52) and np.isfinite(high_52) and high_52 > low_52:
-    field.append({"Method": "52-week trading range", "Low": low_52, "High": high_52, "Mid": price})
-
-if field:
-    method_names = [row["Method"] for row in field]
-    football = go.Figure()
-    for row in field:
-        if row["High"] > row["Low"]:
-            football.add_trace(go.Bar(
-                y=[row["Method"]],
-                x=[row["High"] - row["Low"]],
-                base=[row["Low"]],
-                orientation="h",
-                text=[f"{money(row['Low'])} to {money(row['High'])}"],
-                textposition="inside",
-                hovertemplate=f"{row['Method']}<br>Low: {money(row['Low'])}<br>High: {money(row['High'])}<extra></extra>",
-                showlegend=False,
-            ))
-        else:
-            football.add_trace(go.Scatter(
-                x=[row["Mid"]],
-                y=[row["Method"]],
-                mode="markers+text",
-                marker={"symbol": "diamond", "size": 14},
-                text=[money(row["Mid"])],
-                textposition="middle right",
-                hovertemplate=f"{row['Method']}: {money(row['Mid'])}<extra></extra>",
-                showlegend=False,
-            ))
-
-    if np.isfinite(price) and price > 0:
-        football.add_vline(
-            x=price,
-            line_dash="dash",
-            line_color="black",
-            annotation_text=f"Market price {money(price)}",
-            annotation_position="top",
-        )
-    football.update_yaxes(categoryorder="array", categoryarray=method_names[::-1])
-    football.update_layout(
-        title=f"{ticker} valuation football field",
-        xaxis_title="Value per share (USD)",
-        xaxis_tickprefix="$",
-        yaxis_title="",
-        bargap=0.4,
-    )
-    show_chart(football)
-    st.caption(
-        "Bars show low-to-high ranges: DCF is Bear to Bull; comps use the 25th to 75th "
-        "percentile peer multiple; the 52-week range is the trading range. Diamonds are "
-        "single-point estimates. The dashed line is the current market price."
-    )
-else:
-    st.info("The football field appears once at least one valuation method returns a valid value.")
-
-# ============================================================
-# DISCLAIMER
-# ============================================================
 st.divider()
-st.caption(
-    "Educational use only, not investment advice. Yahoo Finance data may be incomplete or delayed. "
-    "Check company filings and verify assumptions before relying on any valuation."
-)
+
+CACHE_DIR = Path(__file__).resolve().parent / "data_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Streamlit compatibility helper
+try:
+    if Version(st.__version__) >= Version("1.51.0"):
+        STRETCH = {"width": "stretch"}
+    else:
+        STRETCH = {"use_container_width": True}
+except Exception:
+    STRETCH = {"use_container_width": True}
+
+
+def show_df(obj):
+    st.dataframe(obj, **STRETCH)
+
+
+def show_chart(fig):
+    st.plotly_chart(fig, **STRETCH)
+
+
+# ============================================================
+# SAFE HELPERS
+# ============================================================
+def number(value, default=np.nan):
+    """Convert a scalar-like value to a finite float; otherwise return default."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (pd.Series, pd.DataFrame, list, tuple, np.ndarray)):
+            if len(value) == 0:
+                return default
+            value = np.asarray(value).reshape(-1)[0]
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def first_valid(*values):
+    for value in values:
+        value = number(value)
+        if np.isfinite(value):
+            return value
+    return np.nan
+
+
+def divide(a, b):
+    a, b = number(a), number(b)
+    if not np.isfinite(a) or not np.isfinite(b) or b == 0:
+        return np.nan
+    return a / b
+
+
+def money(value):
+    value = number(value)
+    return "N/A" if not np.isfinite(value) else f"${value:,.2f}"
+
+
+def percent(value):
+    value = number(value)
+    return "N/A" if not np.isfinite(value) else f"{value:.1%}"
+
+
+def pick(df, *labels, default=None):
