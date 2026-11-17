@@ -1,13 +1,5 @@
-# =====================================================================
-# Stock Valuation Dashboard (default ticker: ABBV)
-# Part 1  Fundamentals and free cash flow
-# Part 2  DCF valuation (with WACC build-up)
-# Part 3  Comparable-company valuation
-# Part 4  WACC x terminal-growth sensitivity
-# Part 5  Extension: Bear/Base/Bull scenarios + football field
-# Educational use only. Not investment advice.
-# =====================================================================
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -16,649 +8,1255 @@ import streamlit as st
 import yfinance as yf
 from packaging.version import Version
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-st.set_page_config(page_title="Stock Valuation Dashboard", layout="wide")
+# This dashboard analyzes MRK only. Other tickers are used for comparison.
+TICKER = "MRK"
 
-# Streamlit replaced use_container_width with width="stretch" in newer releases.
-# This works on both old and new versions.
-if Version(st.__version__) >= Version("1.51.0"):
-    STRETCH = {"width": "stretch"}
-else:
+# ============================================================
+# SETUP
+# ============================================================
+st.set_page_config(
+    page_title="Merck & Co., Inc. (MRK) Equity Valuation Lab",
+    page_icon="📈",
+    layout="wide",
+)
+
+st.title("Merck & Co., Inc. (MRK) Equity Valuation Lab")
+st.caption(
+    "Created by Khulan Ganzorig | "
+    "MS in Business Analytics, University at Buffalo"
+)
+
+st.markdown(
+    """
+    An equity research project covering financial statement analysis,
+    DCF valuation, comparable company analysis, sensitivity analysis,
+    and scenario modeling.
+    """
+)
+
+st.divider()
+
+# Anchored to this file so the cache is found no matter where the app is launched from.
+CACHE_DIR = Path(__file__).resolve().parent / "data_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# DISPLAY HELPERS (work on old and new Streamlit versions)
+# ============================================================
+try:
+    if Version(st.__version__) >= Version("1.51.0"):
+        STRETCH = {"width": "stretch"}
+    else:
+        STRETCH = {"use_container_width": True}
+except Exception:
     STRETCH = {"use_container_width": True}
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def to_num(x):
-    """Convert to float; return NaN for None / non-numeric / inf."""
+def show_df(obj):
+    st.dataframe(obj, **STRETCH)
+
+
+def show_chart(fig):
+    st.plotly_chart(fig, **STRETCH)
+
+
+# ============================================================
+# SAFE HELPERS
+# ============================================================
+def pick(df, *labels, default=np.nan):
+    """Return the first matching column, else a default."""
+    if not isinstance(df, pd.DataFrame):
+        return default
+    for label in labels:
+        if label in df.columns:
+            return df[label]
+    return default
+
+
+def number(value, default=np.nan):
     try:
-        v = float(x)
-        return v if np.isfinite(v) else np.nan
-    except (TypeError, ValueError):
+        if value is None:
+            return default
+        if isinstance(value, (pd.Series, pd.DataFrame, list, tuple, np.ndarray)):
+            if len(value) == 0:
+                return default
+            value = np.asarray(value).reshape(-1)[0]
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def divide(a, b):
+    a, b = number(a), number(b)
+    if not np.isfinite(a) or not np.isfinite(b) or b == 0:
         return np.nan
+    return a / b
 
 
-def fmt_money(x):
-    x = to_num(x)
-    if not np.isfinite(x):
-        return "N/A"
-    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+def money(value):
+    value = number(value)
+    return "N/A" if not np.isfinite(value) else f"${value:,.2f}"
 
 
-def fmt_b(x):
-    """Format a dollar amount in billions."""
-    x = to_num(x)
-    if not np.isfinite(x):
-        return "N/A"
-    return f"-${abs(x) / 1e9:,.2f}B" if x < 0 else f"${x / 1e9:,.2f}B"
+def percent(value):
+    value = number(value)
+    return "N/A" if not np.isfinite(value) else f"{value:.1%}"
 
 
-def fmt_pct(x, digits=2):
-    x = to_num(x)
-    return "N/A" if not np.isfinite(x) else f"{x:.{digits}%}"
+def normalize_statement(df):
+    """Transpose yfinance statements into date rows, sorted by date."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    result = df.T.copy()
+    result.index = pd.to_datetime(result.index, errors="coerce")
+    result = result.loc[~result.index.isna()]
+    return result.sort_index()
 
 
-def get_row(df, candidates):
-    """First matching row of a yfinance statement as a date-sorted Series, plus the label used."""
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None, None
-    for name in candidates:
-        if name in df.index:
-            s = df.loc[name]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[0]
-            s = pd.to_numeric(s, errors="coerce")
-            s.index = pd.to_datetime(s.index)
-            return s.sort_index(), name
-    return None, None
+def get_series(df, *labels):
+    """Safely retrieve one statement line item as a dated numeric Series."""
+    result = pick(df, *labels, default=None)
+    if not isinstance(result, pd.Series):
+        return pd.Series(dtype=float)
+    result = pd.to_numeric(result, errors="coerce")
+    result.index = pd.to_datetime(result.index, errors="coerce")
+    return result.loc[~result.index.isna()].sort_index().dropna()
 
 
-def latest(series):
-    """Most recent non-null value of a Series (NaN if unavailable)."""
-    if series is None:
-        return np.nan
-    s = series.dropna()
-    return float(s.iloc[-1]) if not s.empty else np.nan
+def latest_value(df, *labels):
+    values = get_series(df, *labels)
+    return number(values.iloc[-1]) if not values.empty else np.nan
 
 
-# ---------------------------------------------------------------------
-# Valuation functions
-# ---------------------------------------------------------------------
-def calculate_dcf(base_fcf, growth, terminal_growth, wacc, years, cash, debt, shares):
-    """Two-stage DCF. Returns None if inputs are invalid (WACC must exceed terminal growth)."""
-    base_fcf, growth = to_num(base_fcf), to_num(growth)
-    terminal_growth, wacc = to_num(terminal_growth), to_num(wacc)
-    shares = to_num(shares)
-    cash = to_num(cash)
-    debt = to_num(debt)
-    cash = 0.0 if not np.isfinite(cash) else cash
-    debt = 0.0 if not np.isfinite(debt) else debt
-
-    if not all(np.isfinite(v) for v in (base_fcf, growth, terminal_growth, wacc, shares)):
-        return None
-    if shares <= 0 or wacc <= 0 or wacc <= terminal_growth or years < 1:
-        return None
-
-    t = np.arange(1, int(years) + 1)
-    fcf = base_fcf * (1 + growth) ** t
-    disc = (1 + wacc) ** t
-    pv = fcf / disc
-    terminal_value = fcf[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
-    pv_terminal = terminal_value / disc[-1]
-    ev = pv.sum() + pv_terminal
-    equity = ev + cash - debt
-    return {
-        "projection": pd.DataFrame({
-            "Year": t,
-            "Projected FCF": fcf,
-            "Discount factor": 1 / disc,
-            "PV of FCF": pv,
-        }),
-        "pv_fcf": float(pv.sum()),
-        "terminal_value": float(terminal_value),
-        "pv_terminal": float(pv_terminal),
-        "ev": float(ev),
-        "equity": float(equity),
-        "intrinsic": float(equity / shares),
-    }
-
-
-def compute_wacc(beta, rf, erp, interest_expense, total_debt, market_cap, tax_rate):
-    """CAPM cost of equity, after-tax cost of debt, market-value weights."""
-    ke = rf + beta * erp
-
-    kd, kd_source = np.nan, "Interest expense / total debt"
-    interest_expense, total_debt = to_num(interest_expense), to_num(total_debt)
-    if np.isfinite(interest_expense) and np.isfinite(total_debt) and total_debt > 0:
-        kd = abs(interest_expense) / total_debt
-    if not np.isfinite(kd):
-        kd, kd_source = rf + 0.015, "Fallback: risk-free rate + 1.5%"
-    kd = float(np.clip(kd, 0.01, 0.12))
-
-    after_tax_kd = kd * (1 - tax_rate)
-
-    market_cap = to_num(market_cap)
-    if np.isfinite(market_cap) and market_cap > 0 and np.isfinite(total_debt) and total_debt >= 0:
-        we = market_cap / (market_cap + total_debt)
-        weights_source = "Market cap and total debt"
-    else:
-        we, weights_source = 1.0, "Fallback: 100% equity (market cap or debt unavailable)"
-    wd = 1 - we
-
-    return {
-        "ke": ke, "kd": kd, "kd_source": kd_source, "after_tax_kd": after_tax_kd,
-        "tax_rate": tax_rate, "we": we, "wd": wd, "weights_source": weights_source,
-        "wacc": we * ke + wd * after_tax_kd,
-    }
-
-
-def implied_value(kind, multiple, metric, debt, cash, shares):
-    """Implied value per share from a peer multiple."""
-    if not (np.isfinite(multiple) and np.isfinite(metric)):
-        return np.nan
-    if kind == "pe":
-        return multiple * metric  # metric = EPS
-    if not (np.isfinite(shares) and shares > 0):
-        return np.nan
-    return (multiple * metric - debt + cash) / shares  # metric = EBITDA or revenue
-
-
-# ---------------------------------------------------------------------
-# Data loading (cached)
-# ---------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Loading Yahoo Finance data...")
-def load_company(ticker):
-    t = yf.Ticker(ticker)
-    out = {}
-    try:
-        out["info"] = t.info or {}
-    except Exception:
-        out["info"] = {}
-    for key, attr in [("cashflow", "cashflow"), ("balance", "balance_sheet"), ("income", "income_stmt")]:
-        try:
-            out[key] = getattr(t, attr)
-        except Exception:
-            out[key] = pd.DataFrame()
-    try:
-        h = t.history(period="5d")["Close"].dropna()
-        out["last_close"] = float(h.iloc[-1]) if not h.empty else np.nan
-    except Exception:
-        out["last_close"] = np.nan
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner="Loading peer multiples...")
-def load_peer_multiples(tickers):
-    rows = []
-    for tk in tickers:
-        try:
-            info = yf.Ticker(tk).info or {}
-        except Exception:
-            info = {}
-        rows.append({
-            "Ticker": tk,
-            "P/E": to_num(info.get("trailingPE")),
-            "EV/EBITDA": to_num(info.get("enterpriseToEbitda")),
-            "EV/Revenue": to_num(info.get("enterpriseToRevenue")),
-        })
-    return pd.DataFrame(rows)
-
-
-@st.cache_data(ttl=3600)
-def load_risk_free():
-    """10-year Treasury yield from Yahoo (^TNX, quoted in percent). NaN if unavailable."""
-    try:
-        h = yf.Ticker("^TNX").history(period="5d")["Close"].dropna()
-        v = float(h.iloc[-1]) / 100
-        if 0 < v < 0.15:
-            return v
-    except Exception:
-        pass
+def first_valid(*values):
+    for value in values:
+        value = number(value)
+        if np.isfinite(value):
+            return value
     return np.nan
 
 
-# ---------------------------------------------------------------------
-# Sidebar inputs
-# ---------------------------------------------------------------------
-st.sidebar.header("Inputs")
-ticker = st.sidebar.text_input("Ticker", "ABBV").upper().strip()
-peer_text = st.sidebar.text_input("Peer tickers (comma-separated)", "LLY, MRK, PFE, BMY, AMGN, JNJ")
-peers = tuple(p.strip().upper() for p in peer_text.split(",") if p.strip() and p.strip().upper() != ticker)
+# ============================================================
+# CSV CACHE
+# ============================================================
+def safe_ticker(ticker):
+    return "".join(c for c in ticker.upper() if c.isalnum() or c in "._-")
 
-st.sidebar.subheader("DCF assumptions")
-years = st.sidebar.slider("Projection years", 3, 10, 5)
-fcf_growth = st.sidebar.slider("Annual FCF growth (%)", -5.0, 15.0, 5.0, 0.5) / 100
-terminal_growth = st.sidebar.slider("Terminal growth (%)", 0.0, 4.0, 2.5, 0.25) / 100
 
-st.sidebar.subheader("WACC inputs")
-rf_fetched = load_risk_free()
-rf_default = round(rf_fetched * 100, 2) if np.isfinite(rf_fetched) else 4.25
-rf = st.sidebar.number_input("Risk-free rate (%)", 0.0, 15.0, rf_default, 0.05) / 100
-erp = st.sidebar.number_input("Equity risk premium (%)", 0.0, 12.0, 5.0, 0.25) / 100
-override_wacc = st.sidebar.checkbox("Override WACC manually")
-wacc_manual = st.sidebar.number_input("Manual WACC (%)", 1.0, 25.0, 8.0, 0.25) / 100
+def save_cache(ticker, data):
+    symbol = safe_ticker(ticker)
 
-st.sidebar.subheader("Balance-sheet items")
-override_bs = st.sidebar.checkbox("Override cash and debt ($ billions)")
-cash_manual = st.sidebar.number_input("Cash ($B)", 0.0, 500.0, 5.0, 0.5) * 1e9
-debt_manual = st.sidebar.number_input("Debt ($B)", 0.0, 1000.0, 60.0, 0.5) * 1e9
+    for name in ("income", "balance", "cashflow"):
+        try:
+            if not data[name].empty:
+                data[name].to_csv(
+                    CACHE_DIR / f"{symbol}_{name}.csv",
+                    index_label="Date",
+                )
+        except Exception:
+            pass
 
-# ---------------------------------------------------------------------
-# Load data
-# ---------------------------------------------------------------------
-st.title(f"{ticker} Valuation Dashboard")
-st.caption("Educational use only. Data from Yahoo Finance (yfinance) and may be incomplete or delayed. Not investment advice.")
+    try:
+        if data.get("info"):
+            pd.DataFrame([data["info"]]).to_csv(
+                CACHE_DIR / f"{symbol}_info.csv",
+                index=False,
+            )
+    except Exception:
+        pass
 
-data = load_company(ticker)
-info, cashflow, balance, income = data["info"], data["cashflow"], data["balance"], data["income"]
 
-cfo_s, cfo_label = get_row(cashflow, [
-    "Operating Cash Flow", "Total Cash From Operating Activities",
-    "Cash Flow From Continuing Operating Activities"])
-capex_s, capex_label = get_row(cashflow, [
-    "Capital Expenditure", "Capital Expenditures", "Purchase Of PPE"])
+def load_cache(ticker):
+    symbol = safe_ticker(ticker)
+    data = {}
+    found = False
 
-if cfo_s is None or capex_s is None:
-    st.error("Could not find operating cash flow and capital expenditure in Yahoo Finance data for this ticker.")
+    for name in ("income", "balance", "cashflow"):
+        path = CACHE_DIR / f"{symbol}_{name}.csv"
+        if path.exists():
+            try:
+                df = pd.read_csv(path, index_col=0, parse_dates=True)
+                df.index = pd.to_datetime(df.index, errors="coerce")
+                df = df.loc[~df.index.isna()].sort_index()
+                data[name] = df
+                found = found or not df.empty
+            except Exception:
+                data[name] = pd.DataFrame()
+        else:
+            data[name] = pd.DataFrame()
+
+    info = {}
+    info_path = CACHE_DIR / f"{symbol}_info.csv"
+    if info_path.exists():
+        try:
+            df = pd.read_csv(info_path)
+            if not df.empty:
+                info = df.iloc[0].to_dict()
+        except Exception:
+            pass
+
+    if not found:
+        return None
+
+    price = first_valid(info.get("currentPrice"), info.get("regularMarketPrice"))
+    return {**data, "info": info, "price": price}
+
+
+# ============================================================
+# DATA DOWNLOAD
+# Raises on failure so Streamlit does NOT cache an empty result.
+# ============================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def download_data(ticker):
+    stock = yf.Ticker(ticker)
+
+    def statement(attribute):
+        try:
+            return normalize_statement(getattr(stock, attribute))
+        except Exception:
+            return pd.DataFrame()
+
+    income = statement("income_stmt")
+    balance = statement("balance_sheet")
+    cashflow = statement("cashflow")
+
+    if income.empty and balance.empty and cashflow.empty:
+        raise RuntimeError("Yahoo Finance returned no financial statements.")
+
+    info = {}
+    try:
+        info = stock.info or {}
+    except Exception:
+        pass
+
+    price = first_valid(info.get("currentPrice"), info.get("regularMarketPrice"))
+
+    if not np.isfinite(price):
+        try:
+            history = stock.history(period="5d")
+            if not history.empty:
+                price = number(history["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+
+    return {
+        "income": income,
+        "balance": balance,
+        "cashflow": cashflow,
+        "info": info,
+        "price": price,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_peer_multiples(peer):
+    """Cached per peer. Raises on failure so failures are not cached."""
+    info = yf.Ticker(peer).info or {}
+    return {
+        "Ticker": peer,
+        "P/E": number(info.get("trailingPE")),
+        "EV/EBITDA": number(info.get("enterpriseToEbitda")),
+        "P/S": number(info.get("priceToSalesTrailing12Months")),
+    }
+
+
+def load_data(ticker, csv_only=False):
+    if csv_only:
+        cached = load_cache(ticker)
+        if cached:
+            return cached, "CSV cache"
+        return None, "No usable CSV cache found in data_cache/."
+
+    try:
+        data = download_data(ticker)
+        save_cache(ticker, data)
+        return data, "Yahoo Finance"
+    except Exception as error:
+        cached = load_cache(ticker)
+        if cached:
+            return cached, f"CSV fallback used (Yahoo error: {error})"
+        return None, (
+            f"Unable to retrieve financial data: {error}. "
+            "No cached CSV files were found."
+        )
+
+
+# ============================================================
+# FUNDAMENTALS AND FCF
+# ============================================================
+def calculate_fundamentals(data):
+    income = data["income"]
+    balance = data["balance"]
+    cashflow = data["cashflow"]
+
+    revenue = get_series(income, "Total Revenue", "Operating Revenue", "Revenue")
+    net_income = get_series(
+        income,
+        "Net Income",
+        "Net Income Common Stockholders",
+        "Net Income From Continuing Operation Net Minority Interest",
+    )
+    operating_cf = get_series(
+        cashflow,
+        "Operating Cash Flow",
+        "Cash Flow From Continuing Operating Activities",
+        "Total Cash From Operating Activities",
+    )
+    capex = get_series(
+        cashflow,
+        "Capital Expenditure",
+        "Capital Expenditures",
+        "Purchase Of Property Plant And Equipment",
+    )
+
+    dates = sorted(
+        set(revenue.index)
+        | set(net_income.index)
+        | set(operating_cf.index)
+        | set(capex.index)
+    )
+
+    annual = pd.DataFrame(index=pd.DatetimeIndex(dates, name="Date"))
+    annual["Revenue"] = revenue
+    annual["Net Income"] = net_income
+    annual["Operating Cash Flow"] = operating_cf
+    annual["CapEx"] = capex
+
+    # FCF = Operating Cash Flow - |CapEx|
+    annual["FCF"] = annual["Operating Cash Flow"] - annual["CapEx"].abs()
+    annual["Net Margin"] = annual["Net Income"] / annual["Revenue"].replace(0, np.nan)
+    annual["FCF Margin"] = annual["FCF"] / annual["Revenue"].replace(0, np.nan)
+    annual = annual.sort_index()
+
+    # Average of up to the latest three annual FCF observations.
+    fcf_values = annual["FCF"].dropna()
+    fcf_count = min(len(fcf_values), 3)
+    base_fcf = number(fcf_values.tail(3).mean()) if fcf_count >= 1 else np.nan
+
+    current_assets = latest_value(balance, "Current Assets", "Total Current Assets")
+    current_liabilities = latest_value(
+        balance, "Current Liabilities", "Total Current Liabilities"
+    )
+    debt = latest_value(
+        balance,
+        "Total Debt",
+        "Long Term Debt And Capital Lease Obligation",
+        "Long Term Debt",
+    )
+    equity = latest_value(
+        balance,
+        "Stockholders Equity",
+        "Total Stockholder Equity",
+        "Common Stock Equity",
+        "Total Equity Gross Minority Interest",
+    )
+
+    return annual, {
+        "current_ratio": divide(current_assets, current_liabilities),
+        "debt_equity": divide(debt, equity),
+        "debt": debt,
+        "base_fcf": base_fcf,
+        "fcf_count": fcf_count,
+    }
+
+
+# ============================================================
+# DCF MODEL
+# ============================================================
+def calculate_dcf(base_fcf, growth, terminal_growth, wacc, years, cash, debt, shares):
+    values = [base_fcf, growth, terminal_growth, wacc, cash, debt, shares]
+    if not all(np.isfinite(number(x)) for x in values):
+        return None
+    if shares <= 0 or wacc <= terminal_growth:
+        return None
+
+    forecast_years = np.arange(1, years + 1)
+    projected = base_fcf * (1 + growth) ** forecast_years
+    pv = projected / (1 + wacc) ** forecast_years
+
+    terminal = projected[-1] * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv_terminal = terminal / (1 + wacc) ** years
+    enterprise = pv.sum() + pv_terminal
+    equity_value = enterprise + cash - debt
+    intrinsic = equity_value / shares
+
+    return {
+        "projected": projected,
+        "pv": pv,
+        "terminal": terminal,
+        "pv_terminal": pv_terminal,
+        "enterprise": enterprise,
+        "equity": equity_value,
+        "intrinsic": intrinsic,
+        "terminal_pct": pv_terminal / enterprise if enterprise != 0 else np.nan,
+    }
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+st.sidebar.header("Company and data")
+
+st.sidebar.markdown("**Company:** Merck & Co., Inc. (MRK)")
+ticker = TICKER
+
+data_mode = st.sidebar.radio(
+    "Data source",
+    ["Yahoo Finance with CSV fallback", "CSV only"],
+)
+
+if st.sidebar.button("🔄 Clear cache and reload"):
+    st.cache_data.clear()
+    st.rerun()
+
+show_debug = st.sidebar.checkbox("Show debug panel", value=False)
+
+st.sidebar.caption(
+    "CSV files are saved in data_cache as MRK_income.csv, "
+    "MRK_balance.csv, MRK_cashflow.csv, and MRK_info.csv."
+)
+
+st.sidebar.header("Part 2 — DCF assumptions")
+
+years = st.sidebar.slider("Forecast years", min_value=3, max_value=10, value=5)
+
+growth = st.sidebar.slider(
+    "Forecast FCF growth",
+    min_value=-0.20, max_value=0.40, value=0.06, step=0.01, format="%.2f",
+)
+
+terminal_growth = st.sidebar.slider(
+    "Terminal growth",
+    min_value=-0.01, max_value=0.06, value=0.025, step=0.0025, format="%.3f",
+)
+
+risk_free = st.sidebar.slider("Risk-free rate", 0.0, 0.10, 0.04, 0.005)
+
+beta = st.sidebar.number_input(
+    "Beta", min_value=0.0, max_value=4.0, value=1.0, step=0.1
+)
+
+equity_risk_premium = st.sidebar.slider("Equity risk premium", 0.0, 0.12, 0.05, 0.005)
+cost_of_debt = st.sidebar.slider("Pre-tax cost of debt", 0.0, 0.20, 0.05, 0.005)
+tax_rate = st.sidebar.slider("Tax rate", 0.0, 0.50, 0.21, 0.01)
+
+
+# ============================================================
+# LOAD COMPANY DATA
+# ============================================================
+with st.spinner(f"Loading data for {ticker}..."):
+    data, data_message = load_data(ticker, csv_only=(data_mode == "CSV only"))
+
+if data is None:
+    st.error(data_message)
+    st.info(
+        "Tip: run the app locally once so data_cache/*.csv files are created, "
+        "then commit them to your repo so the fallback works when deployed."
+    )
     st.stop()
 
-# Assignment-defined free cash flow: operating cash flow minus capital expenditures
-fcf_s = (cfo_s - capex_s.abs()).dropna()
-if fcf_s.empty:
-    st.error("Free cash flow could not be computed from the available statements.")
-    st.stop()
+st.caption(f"Data source: {data_message}")
 
-last3 = fcf_s.tail(3)
-base_fcf = float(last3.mean())
+annual, fundamentals = calculate_fundamentals(data)
+info = data.get("info", {}) or {}
 
-# Price, shares, market cap
-price = to_num(info.get("currentPrice"))
-if not np.isfinite(price):
-    price = to_num(info.get("regularMarketPrice"))
-if not np.isfinite(price):
-    price = to_num(data.get("last_close"))
+price = number(data.get("price"))
+shares = number(info.get("sharesOutstanding"))
+market_cap = number(info.get("marketCap"))
 
-shares = to_num(info.get("sharesOutstanding"))
-if not np.isfinite(shares):
-    sh_s, _ = get_row(balance, ["Ordinary Shares Number", "Share Issued"])
-    shares = latest(sh_s)
-if not np.isfinite(shares):
-    sh_s, _ = get_row(income, ["Diluted Average Shares", "Basic Average Shares"])
-    shares = latest(sh_s)
-
-market_cap = to_num(info.get("marketCap"))
-if not np.isfinite(market_cap) and np.isfinite(price) and np.isfinite(shares):
+if not np.isfinite(market_cap) and price > 0 and np.isfinite(shares) and shares > 0:
     market_cap = price * shares
 
-beta = to_num(info.get("beta"))
-beta_note = ""
-if not np.isfinite(beta):
-    beta, beta_note = 1.0, "Beta unavailable from Yahoo; 1.0 used."
+if not np.isfinite(shares) and np.isfinite(market_cap) and market_cap > 0 and price > 0:
+    shares = market_cap / price
 
-# Balance sheet items
-cash_s, cash_label = get_row(balance, [
-    "Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents"])
-debt_s, debt_label = get_row(balance, ["Total Debt"])
-cash_bs, debt_bs = latest(cash_s), latest(debt_s)
+cash = first_valid(
+    info.get("totalCash"),
+    latest_value(
+        data["balance"],
+        "Cash And Cash Equivalents",
+        "Cash Cash Equivalents And Short Term Investments",
+        "Cash And Cash Equivalents And Short Term Investments",
+    ),
+    0.0,
+)
 
-if override_bs:
-    cash_assumption, debt_assumption = cash_manual, debt_manual
+debt = first_valid(fundamentals["debt"], info.get("totalDebt"), 0.0)
+base_fcf = fundamentals["base_fcf"]
+
+if show_debug:
+    with st.expander("🐞 Debug panel", expanded=True):
+        st.write("Data source:", data_message)
+        st.write(
+            "Statement shapes:",
+            {k: data[k].shape for k in ("income", "balance", "cashflow")},
+        )
+        st.write(
+            {
+                "price": price,
+                "shares": shares,
+                "market_cap": market_cap,
+                "cash": cash,
+                "debt": debt,
+                "base_fcf": base_fcf,
+                "fcf_observations_used": fundamentals["fcf_count"],
+            }
+        )
+        if not annual.empty:
+            show_df(annual[["Operating Cash Flow", "CapEx", "FCF"]])
+
+
+# ============================================================
+# PART 1 — FUNDAMENTALS & FREE CASH FLOW
+# ============================================================
+st.header("Part 1 — Fundamentals & Free Cash Flow")
+
+st.write(
+    "Annual income statement, balance sheet, and cash-flow data are "
+    "transposed into date rows and sorted chronologically. "
+    "Missing statement labels are handled safely."
+)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Current market price", money(price))
+col2.metric(
+    "Current ratio",
+    f"{fundamentals['current_ratio']:.2f}"
+    if np.isfinite(fundamentals["current_ratio"]) else "N/A",
+)
+col3.metric(
+    "Debt / equity",
+    f"{fundamentals['debt_equity']:.2f}"
+    if np.isfinite(fundamentals["debt_equity"]) else "N/A",
+)
+
+st.subheader("Last four annual periods")
+
+if annual.empty:
+    st.warning("No annual fundamentals are available.")
 else:
-    cash_assumption = 0.0 if not np.isfinite(cash_bs) else cash_bs
-    debt_assumption = 0.0 if not np.isfinite(debt_bs) else debt_bs
+    display = annual.tail(4).copy()
 
-# Tax rate and interest expense
-int_s, int_label = get_row(income, ["Interest Expense", "Interest Expense Non Operating"])
-tax_s, _ = get_row(income, ["Tax Provision"])
-pretax_s, _ = get_row(income, ["Pretax Income"])
-tax_rate = 0.21
-if tax_s is not None and pretax_s is not None:
-    t_val, p_val = latest(tax_s), latest(pretax_s)
-    if np.isfinite(t_val) and np.isfinite(p_val) and p_val > 0:
-        tax_rate = float(np.clip(t_val / p_val, 0.0, 0.35))
+    for col in ["Revenue", "Net Income", "Operating Cash Flow", "CapEx", "FCF"]:
+        display[col] = display[col].map(
+            lambda x: "N/A" if pd.isna(x) else f"${x:,.0f}"
+        )
 
-wacc_calc = compute_wacc(beta, rf, erp, latest(int_s), debt_assumption, market_cap, tax_rate)
-selected_wacc = wacc_manual if override_wacc else wacc_calc["wacc"]
+    for col in ["Net Margin", "FCF Margin"]:
+        display[col] = display[col].map(
+            lambda x: "N/A" if pd.isna(x) else f"{x:.1%}"
+        )
 
-# =====================================================================
-# PART 1: FUNDAMENTALS AND FREE CASH FLOW
-# =====================================================================
-st.header("Part 1: Fundamentals and Free Cash Flow")
+    display.index = display.index.strftime("%Y")
+    show_df(display)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Price", fmt_money(price))
-c2.metric("Market cap", fmt_b(market_cap))
-c3.metric("Beta", f"{beta:.2f}")
-c4.metric("Shares outstanding", f"{shares / 1e9:,.3f}B" if np.isfinite(shares) else "N/A")
+if np.isfinite(base_fcf):
+    label = (
+        "Three-year average FCF"
+        if fundamentals["fcf_count"] >= 3
+        else f"Average FCF ({fundamentals['fcf_count']} year(s) available)"
+    )
+    st.metric(label, money(base_fcf))
+    if fundamentals["fcf_count"] < 3:
+        st.warning(
+            "Fewer than three annual FCF observations were available, "
+            "so the base FCF uses fewer years than intended."
+        )
+else:
+    st.warning("No annual FCF observations are available for the DCF.")
 
-fcf_table = pd.DataFrame({
-    "Operating cash flow": cfo_s,
-    "CapEx (absolute)": capex_s.abs(),
-    "Free cash flow": cfo_s - capex_s.abs(),
-}).dropna(how="all").sort_index(ascending=False)
-fcf_table.index = fcf_table.index.year
-fcf_table.index.name = "Fiscal year"
-st.dataframe(fcf_table.style.format(lambda v: fmt_b(v), na_rep="N/A"), **STRETCH)
+st.caption(
+    "FCF = Operating Cash Flow − |CapEx|. Missing data is shown as N/A where possible."
+)
 
-fig_fcf = go.Figure(go.Bar(
-    x=[str(d.year) for d in fcf_s.index],
-    y=(fcf_s / 1e9).tolist(),
-    text=[fmt_b(v) for v in fcf_s],
-    textposition="outside",
-))
-fig_fcf.update_layout(title="Annual free cash flow (CFO minus CapEx)",
-                      xaxis_title="Fiscal year", yaxis_title="$ billions", yaxis_tickprefix="$")
-st.plotly_chart(fig_fcf, **STRETCH)
+with st.expander("View the three financial statements"):
+    st.subheader("Income statement")
+    show_df(data["income"])
+    st.subheader("Balance sheet")
+    show_df(data["balance"])
+    st.subheader("Cash-flow statement")
+    show_df(data["cashflow"])
 
-st.success(f"Base FCF (average of the latest {len(last3)} annual observations): {fmt_b(base_fcf)}")
-if len(last3) < 3:
-    st.warning("Fewer than three annual FCF observations are available; the average uses what exists.")
-if base_fcf <= 0:
-    st.warning("Base FCF is not positive, so a DCF on this cash flow is not meaningful.")
 
-with st.expander("Data diagnostics"):
-    st.write({
-        "Operating cash flow row": cfo_label,
-        "CapEx row": capex_label,
-        "Cash row": cash_label,
-        "Debt row": debt_label,
-        "Interest expense row": int_label,
-        "Latest cash used": fmt_b(cash_assumption),
-        "Latest debt used": fmt_b(debt_assumption),
+# ============================================================
+# PART 2 — DCF VALUATION
+# ============================================================
+st.header("Part 2 — DCF Valuation")
+
+cost_of_equity = risk_free + beta * equity_risk_premium
+
+if np.isfinite(market_cap) and market_cap > 0:
+    equity_weight = market_cap / (market_cap + max(debt, 0))
+    debt_weight = 1 - equity_weight
+    capm_wacc = (
+        equity_weight * cost_of_equity
+        + debt_weight * cost_of_debt * (1 - tax_rate)
+    )
+else:
+    capm_wacc = cost_of_equity
+    st.warning(
+        "Market capitalization is unavailable. Using CAPM cost of equity "
+        "as the starting discount rate."
+    )
+
+st.sidebar.header("Adjustable discount rate")
+
+wacc = st.sidebar.slider(
+    "WACC",
+    min_value=0.01,
+    max_value=0.30,
+    value=float(np.clip(capm_wacc, 0.01, 0.30)),
+    step=0.005,
+    format="%.3f",
+)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("CAPM cost of equity", percent(cost_of_equity))
+col2.metric("CAPM-based starting WACC", percent(capm_wacc))
+col3.metric("Selected WACC", percent(wacc))
+
+dcf = None
+
+if not np.isfinite(base_fcf):
+    st.error("DCF cannot be calculated: no usable annual FCF data.")
+elif not np.isfinite(shares) or shares <= 0:
+    st.error("DCF cannot be calculated: shares outstanding are unavailable.")
+elif terminal_growth >= wacc:
+    st.error(
+        "Terminal growth must be lower than WACC. "
+        "Reduce terminal growth or increase WACC."
+    )
+else:
+    dcf = calculate_dcf(
+        base_fcf, growth, terminal_growth, wacc, years, cash, debt, shares
+    )
+
+if dcf is not None:
+    intrinsic = dcf["intrinsic"]
+    dcf_value = intrinsic
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("DCF intrinsic value / share", money(intrinsic))
+    col2.metric("Market price", money(price))
+    col3.metric(
+        "Implied upside / downside",
+        percent(intrinsic / price - 1)
+        if np.isfinite(price) and price > 0 else "N/A",
+    )
+
+    col1, col2 = st.columns(2)
+    col1.metric("Enterprise value", money(dcf["enterprise"]))
+    col2.metric(
+        "PV of terminal value / enterprise value",
+        percent(dcf["terminal_pct"]),
+    )
+
+    forecast = pd.DataFrame({
+        "Year": np.arange(1, years + 1),
+        "Projected FCF": dcf["projected"],
+        "PV of FCF": dcf["pv"],
     })
 
-# =====================================================================
-# PART 2: DCF VALUATION
-# =====================================================================
-st.header("Part 2: DCF Valuation")
+    st.subheader("DCF forecast")
+    show_df(
+        forecast.style.format({
+            "Projected FCF": "${:,.0f}",
+            "PV of FCF": "${:,.0f}",
+        })
+    )
+else:
+    intrinsic = np.nan
+    dcf_value = np.nan
 
-st.subheader("WACC build-up")
-wacc_table = pd.DataFrame([
-    ("Risk-free rate", fmt_pct(rf)),
-    ("Equity risk premium", fmt_pct(erp)),
-    ("Beta", f"{beta:.2f}"),
-    ("Cost of equity (CAPM)", fmt_pct(wacc_calc["ke"])),
-    ("Pre-tax cost of debt", f"{fmt_pct(wacc_calc['kd'])} ({wacc_calc['kd_source']})"),
-    ("Tax rate", fmt_pct(wacc_calc["tax_rate"])),
-    ("After-tax cost of debt", fmt_pct(wacc_calc["after_tax_kd"])),
-    ("Equity weight", f"{fmt_pct(wacc_calc['we'])} ({wacc_calc['weights_source']})"),
-    ("Debt weight", fmt_pct(wacc_calc["wd"])),
-    ("Computed WACC", fmt_pct(wacc_calc["wacc"])),
-    ("WACC used in the model", fmt_pct(selected_wacc) + (" (manual override)" if override_wacc else "")),
-], columns=["Component", "Value"])
-st.dataframe(wacc_table, hide_index=True, **STRETCH)
-if beta_note:
-    st.warning(beta_note)
 
-dcf = calculate_dcf(base_fcf, fcf_growth, terminal_growth, selected_wacc, years,
-                    cash_assumption, debt_assumption, shares)
+# ============================================================
+# PART 3 — COMPARABLE COMPANY ANALYSIS
+# ============================================================
+st.header("Part 3 — Comparable Company Analysis")
+
+peer_input = st.text_input(
+    "Peer tickers used for comparison (separated by commas)",
+    value="PFE, ABBV, BMY, AMGN, GILD",
+)
+
+peer_tickers = list(dict.fromkeys(
+    peer.strip().upper()
+    for peer in peer_input.split(",")
+    if peer.strip() and peer.strip().upper() != ticker
+))
+
+peer_rows = []
+
+with st.spinner("Retrieving peer valuation multiples..."):
+    for peer in peer_tickers:
+        try:
+            peer_rows.append(get_peer_multiples(peer))
+        except Exception:
+            peer_rows.append({
+                "Ticker": peer,
+                "P/E": np.nan,
+                "EV/EBITDA": np.nan,
+                "P/S": np.nan,
+            })
+
+peers = pd.DataFrame(peer_rows, columns=["Ticker", "P/E", "EV/EBITDA", "P/S"])
+
+comps_value = np.nan
+comp_ranges = []  # used by the football field in Part 5
+
+if peers.empty:
+    st.info("Enter peer tickers to calculate comparable-company valuations.")
+else:
+    # Peer medians use only positive multiples (missing, zero and negative are excluded)
+    median_row = {"Ticker": "PEER MEDIAN"}
+    for col in ["P/E", "EV/EBITDA", "P/S"]:
+        values = peers[col].dropna()
+        values = values[values > 0]
+        median_row[col] = values.median() if not values.empty else np.nan
+
+    peers_display = pd.concat(
+        [peers, pd.DataFrame([median_row])], ignore_index=True
+    )
+
+    def highlight_median(row):
+        if row["Ticker"] == "PEER MEDIAN":
+            return ["background-color: #d9ead3; font-weight: bold;"] * len(row)
+        return [""] * len(row)
+
+    st.subheader("Peer multiples and median")
+    show_df(
+        peers_display.style
+        .format(
+            {"P/E": "{:.2f}x", "EV/EBITDA": "{:.2f}x", "P/S": "{:.2f}x"},
+            na_rep="N/A",
+        )
+        .apply(highlight_median, axis=1)
+    )
+
+    # Company metrics
+    eps = number(info.get("trailingEps"))
+
+    sales = first_valid(
+        info.get("totalRevenue"),
+        latest_value(
+            data["income"], "Total Revenue", "Operating Revenue", "Revenue"
+        ),
+    )
+
+    ebitda = number(info.get("ebitda"))
+
+    if not np.isfinite(ebitda):
+        operating_income = latest_value(data["income"], "Operating Income", "EBIT")
+        depreciation = latest_value(
+            data["cashflow"],
+            "Depreciation And Amortization",
+            "Depreciation Amortization Depletion",
+        )
+        if np.isfinite(operating_income) and np.isfinite(depreciation):
+            ebitda = operating_income + depreciation
+
+    pe_median = number(median_row["P/E"])
+    ev_ebitda_median = number(median_row["EV/EBITDA"])
+    ps_median = number(median_row["P/S"])
+
+    def implied_per_share(method, multiple):
+        """Implied MRK value per share from a peer multiple."""
+        if not (np.isfinite(multiple) and multiple > 0):
+            return np.nan
+        if method == "P/E":
+            return eps * multiple if np.isfinite(eps) and eps > 0 else np.nan
+        if method == "EV/EBITDA":
+            if np.isfinite(ebitda) and ebitda > 0 and np.isfinite(shares) and shares > 0:
+                return (ebitda * multiple + cash - debt) / shares
+            return np.nan
+        if method == "P/S":
+            if np.isfinite(sales) and sales > 0 and np.isfinite(shares) and shares > 0:
+                return sales * multiple / shares
+            return np.nan
+        return np.nan
+
+    pe_value = implied_per_share("P/E", pe_median)
+    ev_ebitda_value = implied_per_share("EV/EBITDA", ev_ebitda_median)
+    ps_value = implied_per_share("P/S", ps_median)
+
+    # 25th-75th percentile peer multiples give a range for the football field
+    for method, mid in [("P/E", pe_value), ("EV/EBITDA", ev_ebitda_value), ("P/S", ps_value)]:
+        vals = peers[method].dropna()
+        vals = vals[vals > 0]
+        low = implied_per_share(method, vals.quantile(0.25)) if len(vals) else np.nan
+        high = implied_per_share(method, vals.quantile(0.75)) if len(vals) else np.nan
+        comp_ranges.append({"Method": method, "Low": low, "High": high, "Mid": mid})
+
+    implied_values = pd.DataFrame({
+        "Method": ["P/E", "EV/EBITDA", "P/S"],
+        "Peer Median Multiple": [pe_median, ev_ebitda_median, ps_median],
+        "Company Metric": [eps, ebitda, sales],
+        "Implied Value / Share": [pe_value, ev_ebitda_value, ps_value],
+    })
+
+    st.subheader(f"{ticker} Implied Share Price Using Peer Market Benchmarks")
+    show_df(
+        implied_values.style.format(
+            {
+                "Peer Median Multiple": "{:.2f}x",
+                "Company Metric": "{:,.2f}",
+                "Implied Value / Share": "${:,.2f}",
+            },
+            na_rep="N/A",
+        )
+    )
+
+    valid_comp_values = implied_values["Implied Value / Share"].dropna()
+    comps_value = (
+        valid_comp_values.median() if not valid_comp_values.empty else np.nan
+    )
+
+    st.subheader("Valuation comparison")
+
+    comparison = pd.DataFrame({
+        "Method": [
+            "Comparable-company value",
+            "DCF intrinsic value",
+            "Current market price",
+        ],
+        "Value per Share": [comps_value, dcf_value, price],
+    })
+
+    show_df(
+        comparison.style.format({"Value per Share": "${:,.2f}"}, na_rep="N/A")
+    )
+
+    if (
+        np.isfinite(comps_value)
+        and np.isfinite(dcf_value)
+        and np.isfinite(price)
+    ):
+        comparison_chart = go.Figure()
+        comparison_chart.add_trace(go.Bar(
+            x=["Comparable Companies", "DCF", "Market Price"],
+            y=[comps_value, dcf_value, price],
+            text=[money(comps_value), money(dcf_value), money(price)],
+            textposition="outside",
+        ))
+        comparison_chart.update_layout(
+            title="Comps vs. DCF vs. Market Price",
+            yaxis_title="Value per share ($)",
+            showlegend=False,
+        )
+        show_chart(comparison_chart)
+
+    st.markdown(
+        """
+        **Why the valuations may differ**
+
+        - **Comparable-company valuation:** reflects how the market prices
+          peer earnings, EBITDA, or sales.
+        - **DCF valuation:** depends on projected cash flows, forecast growth,
+          WACC, and terminal growth.
+        - **Market price:** reflects investors' current expectations,
+          sentiment, risks, and other information.
+
+        Peer selection, accounting differences, margins, growth, debt,
+        and missing multiples can also cause differences.
+        """
+    )
+
+
+# ============================================================
+# PART 4 — TWO-WAY SENSITIVITY ANALYSIS
+# ============================================================
+st.header("Part 4 — Sensitivity Analysis")
 
 if dcf is None:
-    st.error("DCF could not be computed. WACC must exceed terminal growth, and base FCF, WACC and shares must be valid.")
-else:
-    proj = dcf["projection"].copy()
-    st.dataframe(
-        proj.style.format({
-            "Projected FCF": lambda v: fmt_b(v),
-            "Discount factor": "{:.4f}",
-            "PV of FCF": lambda v: fmt_b(v),
-        }),
-        hide_index=True, **STRETCH)
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("PV of projected FCF", fmt_b(dcf["pv_fcf"]))
-    m2.metric("PV of terminal value", fmt_b(dcf["pv_terminal"]))
-    m3.metric("Enterprise value", fmt_b(dcf["ev"]))
-    m4.metric("Equity value", fmt_b(dcf["equity"]))
-
-    upside = (dcf["intrinsic"] / price - 1) if np.isfinite(price) and price > 0 else np.nan
-    st.metric("Intrinsic value per share", fmt_money(dcf["intrinsic"]),
-              delta=f"{upside:+.1%} vs market price" if np.isfinite(upside) else None)
-    st.write(
-        f"Equity value = enterprise value + cash ({fmt_b(cash_assumption)}) - debt ({fmt_b(debt_assumption)}). "
-        f"Terminal value is {dcf['pv_terminal'] / dcf['ev']:.0%} of enterprise value."
+    st.warning(
+        "Sensitivity analysis requires a valid base-case DCF. "
+        "Check FCF data and ensure terminal growth is below WACC."
     )
-
-    fig_dcf = go.Figure()
-    fig_dcf.add_trace(go.Bar(x=proj["Year"], y=proj["Projected FCF"] / 1e9, name="Projected FCF"))
-    fig_dcf.add_trace(go.Bar(x=proj["Year"], y=proj["PV of FCF"] / 1e9, name="PV of FCF"))
-    fig_dcf.update_layout(barmode="group", title="Projected vs discounted free cash flow",
-                          xaxis_title="Projection year", yaxis_title="$ billions", yaxis_tickprefix="$")
-    st.plotly_chart(fig_dcf, **STRETCH)
-
-# =====================================================================
-# PART 3: COMPARABLE COMPANIES
-# =====================================================================
-st.header("Part 3: Comparable-Company Valuation")
-
-comp_detail = pd.DataFrame()
-if not peers:
-    st.info("Enter at least one peer ticker in the sidebar.")
 else:
-    peer_df = load_peer_multiples(peers)
-    st.dataframe(peer_df.style.format({c: "{:.1f}x" for c in ["P/E", "EV/EBITDA", "EV/Revenue"]}, na_rep="N/A"),
-                 hide_index=True, **STRETCH)
+    wacc_values = sorted(set(
+        round(wacc + delta, 6)
+        for delta in [-0.03, -0.02, -0.01, 0, 0.01, 0.02, 0.03]
+        if 0.01 <= wacc + delta <= 0.30
+    ))
 
-    eps = to_num(info.get("trailingEps"))
-    ebitda = to_num(info.get("ebitda"))
-    revenue = to_num(info.get("totalRevenue"))
-    methods = [
-        ("P/E", "P/E", eps, "pe"),
-        ("EV/EBITDA", "EV/EBITDA", ebitda, "ev"),
-        ("EV/Revenue", "EV/Revenue", revenue, "ev"),
-    ]
-    rows = []
-    for label, col, metric, kind in methods:
-        mult = peer_df[col].astype(float)
-        mult = mult[np.isfinite(mult) & (mult > 0)]  # exclude missing, zero, negative
-        if mult.empty or not np.isfinite(metric) or metric <= 0:
-            rows.append({"Method": label, "Peers used": len(mult), "Median multiple": np.nan,
-                         "Implied value/share": np.nan, "Low value/share": np.nan, "High value/share": np.nan})
-            continue
-        med, p25, p75 = float(mult.median()), float(mult.quantile(0.25)), float(mult.quantile(0.75))
-        rows.append({
-            "Method": label,
-            "Peers used": len(mult),
-            "Median multiple": med,
-            "Implied value/share": implied_value(kind, med, metric, debt_assumption, cash_assumption, shares),
-            "Low value/share": implied_value(kind, p25, metric, debt_assumption, cash_assumption, shares),
-            "High value/share": implied_value(kind, p75, metric, debt_assumption, cash_assumption, shares),
-        })
-    comp_detail = pd.DataFrame(rows)
-    st.dataframe(
-        comp_detail.style.format({
-            "Median multiple": "{:.1f}x",
-            "Implied value/share": lambda v: fmt_money(v),
-            "Low value/share": lambda v: fmt_money(v),
-            "High value/share": lambda v: fmt_money(v),
-        }, na_rep="N/A"),
-        hide_index=True, **STRETCH)
-    st.caption("Low and high are the 25th and 75th percentile peer multiples. Medians exclude missing, zero and negative multiples.")
-
-# =====================================================================
-# PART 4: SENSITIVITY (WACC x TERMINAL GROWTH)
-# =====================================================================
-st.header("Part 4: Sensitivity Analysis")
-
-price_val = to_num(price)
-
-if np.isfinite(base_fcf) and np.isfinite(shares) and shares > 0 and np.isfinite(selected_wacc):
-    wacc_grid = np.round(selected_wacc + np.arange(-0.02, 0.0201, 0.005), 6)
-    tg_grid = np.round(terminal_growth + np.arange(-0.01, 0.0101, 0.005), 6)
-    tg_grid = tg_grid[tg_grid >= 0]
-
-    values = []
-    for w in wacc_grid:
-        row = []
-        for g in tg_grid:
-            res = calculate_dcf(base_fcf, fcf_growth, g, w, years, cash_assumption, debt_assumption, shares)
-            row.append(res["intrinsic"] if res else np.nan)
-        values.append(row)
+    terminal_values = sorted(set(
+        round(terminal_growth + delta, 6)
+        for delta in [-0.02, -0.01, -0.005, 0, 0.005, 0.01, 0.02]
+        if -0.05 <= terminal_growth + delta <= 0.15
+    ))
 
     sensitivity = pd.DataFrame(
-        values,
-        index=[f"{x:.2%}" for x in wacc_grid],
-        columns=[f"{x:.2%}" for x in tg_grid],
+        index=wacc_values, columns=terminal_values, dtype=float
     )
-    sensitivity.index.name = "WACC"
-    sensitivity.columns.name = "Terminal growth"
 
-    st.dataframe(
-        sensitivity.style.format("${:,.2f}", na_rep="N/A").background_gradient(cmap="RdYlGn", axis=None),
-        **STRETCH)
+    for rate in wacc_values:
+        for terminal_g in terminal_values:
+            result = calculate_dcf(
+                base_fcf, growth, terminal_g, rate, years, cash, debt, shares
+            )
+            sensitivity.loc[rate, terminal_g] = (
+                result["intrinsic"] if result is not None else np.nan
+            )
 
-    heat_kwargs = {"zmid": price_val} if np.isfinite(price_val) and price_val > 0 else {}
-    heat = go.Figure(data=go.Heatmap(
-        z=sensitivity.to_numpy(dtype=float),
-        x=sensitivity.columns.tolist(),
-        y=sensitivity.index.tolist(),
-        colorscale="RdYlGn",
-        colorbar={"title": "$ / share"},
-        hovertemplate="WACC: %{y}<br>Terminal growth: %{x}<br>Intrinsic value: $%{z:,.2f}<extra></extra>",
-        **heat_kwargs,
-    ))
-    heat.update_layout(
-        title="Intrinsic value per share: WACC vs terminal growth"
-              + (" (green = above market price)" if heat_kwargs else ""),
-        xaxis_title="Terminal growth",
+    # Locate the base-case cell by nearest grid value (robust to rounding)
+    base_wacc_key = min(sensitivity.index, key=lambda x: abs(float(x) - wacc))
+    base_terminal_key = min(
+        sensitivity.columns, key=lambda x: abs(float(x) - terminal_growth)
+    )
+
+    x_labels = [f"{g:.2%}" for g in terminal_values]
+    y_labels = [f"{r:.2%}" for r in wacc_values]
+
+    base_x = terminal_values.index(base_terminal_key)
+    base_y = wacc_values.index(base_wacc_key)
+
+    cell_text = []
+    for i, rate in enumerate(wacc_values):
+        row = []
+        for j, terminal_g in enumerate(terminal_values):
+            value = sensitivity.loc[rate, terminal_g]
+            text = money(value) if np.isfinite(value) else "N/A"
+            if i == base_y and j == base_x:
+                text = f"BASE<br>{text}"
+            row.append(text)
+        cell_text.append(row)
+
+    heatmap = go.Figure(
+        data=go.Heatmap(
+            z=sensitivity.to_numpy(dtype=float),
+            x=x_labels,
+            y=y_labels,
+            text=cell_text,
+            texttemplate="%{text}",
+            colorscale="RdYlGn",
+            colorbar={"title": "Value / share"},
+            hovertemplate=(
+                "WACC: %{y}<br>Terminal growth: %{x}<br>"
+                "Intrinsic value: $%{z:,.2f}<extra></extra>"
+            ),
+        )
+    )
+
+    heatmap.add_shape(
+        type="rect",
+        x0=base_x - 0.5, x1=base_x + 0.5,
+        y0=base_y - 0.5, y1=base_y + 0.5,
+        line={"color": "black", "width": 4},
+    )
+
+    heatmap.update_layout(
+        title=f"{ticker} DCF Sensitivity: WACC vs. Terminal Growth",
+        xaxis_title="Terminal Growth",
         yaxis_title="WACC",
     )
-    st.plotly_chart(heat, **STRETCH)
 
-    base_row, base_col = f"{selected_wacc:.2%}", f"{terminal_growth:.2%}"
-    if base_row in sensitivity.index and base_col in sensitivity.columns:
-        st.success(f"Base-case grid value: {fmt_money(sensitivity.loc[base_row, base_col])} per share.")
-    valid = sensitivity.to_numpy(dtype=float)
-    valid = valid[np.isfinite(valid)]
-    if valid.size:
-        st.write(f"Across valid grid cells, estimated value ranges from {fmt_money(valid.min())} to {fmt_money(valid.max())} per share.")
-    st.write("**Interpretation:** Lower WACC increases present value; higher terminal growth increases terminal value. "
-             "The model becomes especially sensitive when WACC approaches terminal growth.")
-else:
-    st.info("Sensitivity analysis requires valid base FCF, shares outstanding and WACC.")
+    show_chart(heatmap)
 
-# =====================================================================
-# PART 5: EXTENSION - SCENARIOS + FOOTBALL FIELD
-# =====================================================================
-st.header("Part 5: Extension: Scenario Analysis and Valuation Football Field")
-st.write("Scenario assumptions are illustrative stress tests around the selected base case, not forecasts or investment recommendations.")
+    st.caption(
+        "Rows represent WACC and columns represent terminal growth. "
+        "The outlined BASE cell uses the selected Part 2 assumptions."
+    )
+
+    wacc_range = sensitivity[base_terminal_key].dropna().astype(float)
+    terminal_range = sensitivity.loc[base_wacc_key].dropna().astype(float)
+
+    wacc_impact = (
+        wacc_range.max() - wacc_range.min() if len(wacc_range) >= 2 else np.nan
+    )
+    terminal_impact = (
+        terminal_range.max() - terminal_range.min()
+        if len(terminal_range) >= 2 else np.nan
+    )
+
+    st.subheader("Sensitivity Interpretation")
+
+    st.write(
+        f"At the base-case assumptions, {ticker}'s estimated intrinsic "
+        f"value is **{money(dcf_value)} per share**."
+    )
+
+    if np.isfinite(wacc_impact) and np.isfinite(terminal_impact):
+        if wacc_impact > terminal_impact:
+            st.write(
+                f"**WACC has the greater impact on valuation.** Changing WACC "
+                f"produces a valuation range of {money(wacc_impact)}, compared "
+                f"with {money(terminal_impact)} for terminal growth."
+            )
+        elif terminal_impact > wacc_impact:
+            st.write(
+                f"**Terminal growth has the greater impact on valuation.** "
+                f"Changing terminal growth produces a valuation range of "
+                f"{money(terminal_impact)}, compared with {money(wacc_impact)} "
+                f"for WACC."
+            )
+        else:
+            st.write(
+                "WACC and terminal growth produce equal valuation ranges "
+                "across the tested grid."
+            )
+
+    if np.isfinite(price):
+        above = int((sensitivity > price).sum().sum())
+        below = int((sensitivity < price).sum().sum())
+
+        st.write(
+            f"Compared with the current market price of **{money(price)}**, "
+            f"{above} grid combinations produce an intrinsic value above "
+            f"market price, suggesting potential undervaluation. {below} "
+            f"combinations produce a value below market price, suggesting "
+            f"potential overvaluation."
+        )
+
+        st.caption(
+            "These comparisons reflect the model assumptions and are not "
+            "predictions of future stock performance."
+        )
 
 
-def run_scenario(g, w, tg):
-    """DCF for one scenario; None if inputs are invalid (WACC must exceed terminal growth)."""
-    if not (np.isfinite(base_fcf) and np.isfinite(shares) and shares > 0 and w > tg):
-        return None
-    return calculate_dcf(base_fcf, g, tg, w, years, cash_assumption, debt_assumption, shares)
+# ============================================================
+# PART 5 — EXTENSION: BULL / BASE / BEAR SCENARIOS
+# ============================================================
+st.header("Part 5 — Extension: Bull / Base / Bear Scenarios")
+
+st.write(
+    "These are alternative assumption sets. They use the same base FCF, "
+    "cash, debt, shares, and forecast horizon, but change growth, "
+    "terminal growth, and WACC."
+)
+
+scenario_presets = {
+    "Bear": {"growth": -0.02, "terminal_growth": 0.015, "wacc_adjustment": 0.02},
+    "Base": {"growth": 0.06, "terminal_growth": 0.025, "wacc_adjustment": 0.00},
+    "Bull": {"growth": 0.12, "terminal_growth": 0.03, "wacc_adjustment": -0.01},
+}
+
+selected_scenario = st.selectbox(
+    "Choose a scenario to inspect", ["Base", "Bull", "Bear"], index=0
+)
+selected = scenario_presets[selected_scenario]
+
+st.write(f"**Selected scenario: {selected_scenario}**")
+
+scenario_cols = st.columns(3)
+scenario_cols[0].metric("Scenario FCF growth", percent(selected["growth"]))
+scenario_cols[1].metric(
+    "Scenario terminal growth", percent(selected["terminal_growth"])
+)
+scenario_cols[2].metric("Scenario WACC", percent(wacc + selected["wacc_adjustment"]))
 
 
-# Bear/Bull keep WACC at least 1 pt above terminal growth so a scenario never
-# silently becomes N/A, and long-run growth is capped at 3%.
-bear_tg = max(0.0, terminal_growth - 0.005)
-bull_tg = max(terminal_growth, min(terminal_growth + 0.005, 0.03))
-scenario_specs = [
-    ("Bear", fcf_growth - 0.03, selected_wacc + 0.015, bear_tg),
-    ("Base", fcf_growth, selected_wacc, terminal_growth),
-    ("Bull", fcf_growth + 0.03, max(selected_wacc - 0.01, bull_tg + 0.01), bull_tg),
-]
+def upside_vs_price(value):
+    if np.isfinite(value) and np.isfinite(price) and price > 0:
+        return value / price - 1
+    return np.nan
 
-scenario_rows = []
-for name, g, w, tg in scenario_specs:
-    result = run_scenario(g, w, tg)
-    value = result["intrinsic"] if result else np.nan
-    has_price = np.isfinite(value) and np.isfinite(price_val) and price_val > 0
-    scenario_rows.append({
-        "Scenario": name,
-        "FCF growth": g,
-        "WACC": w,
-        "Terminal growth": tg,
-        "Intrinsic value/share": value,
-        "vs. market price": (value / price_val - 1) if has_price else np.nan,
+
+scenario_results = []
+
+for scenario_name, assumptions in scenario_presets.items():
+    scenario_rate = wacc + assumptions["wacc_adjustment"]
+
+    result = calculate_dcf(
+        base_fcf,
+        assumptions["growth"],
+        assumptions["terminal_growth"],
+        scenario_rate,
+        years,
+        cash,
+        debt,
+        shares,
+    )
+
+    scenario_value = result["intrinsic"] if result is not None else np.nan
+
+    scenario_results.append({
+        "Scenario": scenario_name,
+        "FCF Growth": assumptions["growth"],
+        "Terminal Growth": assumptions["terminal_growth"],
+        "WACC": scenario_rate,
+        "Intrinsic Value / Share": scenario_value,
+        "Upside / Downside": upside_vs_price(scenario_value),
     })
 
-scenario_df = pd.DataFrame(scenario_rows)
-st.dataframe(
-    scenario_df.style.format({
-        "FCF growth": "{:.1%}",
-        "WACC": "{:.1%}",
-        "Terminal growth": "{:.1%}",
-        "Intrinsic value/share": lambda v: fmt_money(v),
-        "vs. market price": "{:+.1%}",
-    }, na_rep="N/A"),
-    hide_index=True, **STRETCH)
+# Reference row: your current Part 2 assumptions, for side-by-side comparison
+scenario_results.append({
+    "Scenario": "Part 2 (custom)",
+    "FCF Growth": growth,
+    "Terminal Growth": terminal_growth,
+    "WACC": wacc,
+    "Intrinsic Value / Share": dcf_value,
+    "Upside / Downside": upside_vs_price(dcf_value),
+})
 
-scen_value = scenario_df.set_index("Scenario")["Intrinsic value/share"]
-base_value = scen_value.get("Base", np.nan)
-if dcf and np.isfinite(base_value) and abs(base_value - dcf["intrinsic"]) > 0.01:
-    st.warning("The Base scenario does not match the Part 2 DCF value. Check that both use the same inputs.")
+scenario_table = pd.DataFrame(scenario_results)
+scenario_display = scenario_table.copy()
 
-# Football field: horizontal ranges per method, market price as a vertical line
+for col in ["FCF Growth", "Terminal Growth", "WACC", "Upside / Downside"]:
+    scenario_display[col] = scenario_display[col].map(percent)
+
+scenario_display["Intrinsic Value / Share"] = (
+    scenario_display["Intrinsic Value / Share"].map(money)
+)
+
+st.subheader("Scenario comparison")
+
+
+def highlight_selected(row):
+    if row["Scenario"] == selected_scenario:
+        return ["background-color: #d9ead3; font-weight: bold;"] * len(row)
+    return [""] * len(row)
+
+
+show_df(scenario_display.style.apply(highlight_selected, axis=1))
+
+scenario_chart = go.Figure()
+scenario_chart.add_trace(go.Bar(
+    x=scenario_table["Scenario"],
+    y=scenario_table["Intrinsic Value / Share"],
+    text=scenario_table["Intrinsic Value / Share"].map(money),
+    textposition="outside",
+    name="Scenario value",
+))
+
+if np.isfinite(price):
+    scenario_chart.add_hline(
+        y=price,
+        line_dash="dash",
+        annotation_text=f"Market price: {money(price)}",
+    )
+
+scenario_chart.update_layout(
+    title="Bull / Base / Bear valuation",
+    yaxis_title="Intrinsic value per share ($)",
+    showlegend=False,
+)
+
+show_chart(scenario_chart)
+
+st.caption(
+    "The scenario presets are illustrative assumptions, not forecasts. "
+    "The Base preset is fixed (6% growth, 2.5% terminal growth) and may differ "
+    "from your custom Part 2 assumptions; the Part 2 (custom) row shows them side by side."
+)
+
+
+# ------------------------------------------------------------
+# Valuation football field
+# ------------------------------------------------------------
+st.subheader("Valuation football field")
+
+
+def scenario_value_of(name):
+    row = scenario_table.loc[scenario_table["Scenario"] == name, "Intrinsic Value / Share"]
+    return number(row.iloc[0]) if not row.empty else np.nan
+
+
 field = []
-bear_v, bull_v = scen_value.get("Bear", np.nan), scen_value.get("Bull", np.nan)
-if np.isfinite(bear_v) and np.isfinite(bull_v):
-    field.append({"Method": "DCF (bear to bull)", "Low": min(bear_v, bull_v),
-                  "High": max(bear_v, bull_v), "Mid": base_value})
 
-if isinstance(comp_detail, pd.DataFrame) and not comp_detail.empty:
-    for _, row in comp_detail.iterrows():
-        mid = to_num(row.get("Implied value/share"))
-        if not (np.isfinite(mid) and mid > 0):
-            continue
-        low, high = to_num(row.get("Low value/share")), to_num(row.get("High value/share"))
-        if not (np.isfinite(low) and np.isfinite(high) and low > 0):
-            low = high = mid
-        field.append({"Method": f"Comps: {row['Method']}", "Low": min(low, high),
-                      "High": max(low, high), "Mid": mid})
+bear_value = scenario_value_of("Bear")
+bull_value = scenario_value_of("Bull")
+if np.isfinite(bear_value) and np.isfinite(bull_value):
+    field.append({
+        "Method": "DCF (Bear to Bull)",
+        "Low": min(bear_value, bull_value),
+        "High": max(bear_value, bull_value),
+        "Mid": scenario_value_of("Base"),
+    })
+
+for r in comp_ranges:
+    mid, low, high = number(r["Mid"]), number(r["Low"]), number(r["High"])
+    if not (np.isfinite(mid) and mid > 0):
+        continue
+    if not (np.isfinite(low) and np.isfinite(high) and low > 0):
+        low = high = mid
+    field.append({
+        "Method": f"Comps: {r['Method']}",
+        "Low": min(low, high),
+        "High": max(low, high),
+        "Mid": mid,
+    })
+
+low_52 = number(info.get("fiftyTwoWeekLow"))
+high_52 = number(info.get("fiftyTwoWeekHigh"))
+if np.isfinite(low_52) and np.isfinite(high_52) and high_52 > low_52:
+    field.append({
+        "Method": "52-week trading range",
+        "Low": low_52,
+        "High": high_52,
+        "Mid": price,
+    })
 
 if field:
-    st.subheader("Valuation football field")
     method_names = [r["Method"] for r in field]
-    fig = go.Figure()
+    football = go.Figure()
+
     for r in field:
         if r["High"] > r["Low"]:
-            fig.add_trace(go.Bar(
-                y=[r["Method"]], x=[r["High"] - r["Low"]], base=[r["Low"]],
+            football.add_trace(go.Bar(
+                y=[r["Method"]],
+                x=[r["High"] - r["Low"]],
+                base=[r["Low"]],
                 orientation="h",
-                text=[f"{fmt_money(r['Low'])} to {fmt_money(r['High'])}"],
+                text=[f"{money(r['Low'])} to {money(r['High'])}"],
                 textposition="inside",
-                hovertemplate=(f"{r['Method']}<br>Low: {fmt_money(r['Low'])}"
-                               f"<br>High: {fmt_money(r['High'])}<extra></extra>"),
+                hovertemplate=(
+                    f"{r['Method']}<br>Low: {money(r['Low'])}"
+                    f"<br>High: {money(r['High'])}<extra></extra>"
+                ),
                 showlegend=False,
             ))
         else:
-            fig.add_trace(go.Scatter(
-                x=[r["Mid"]], y=[r["Method"]], mode="markers+text",
+            football.add_trace(go.Scatter(
+                x=[r["Mid"]],
+                y=[r["Method"]],
+                mode="markers+text",
                 marker={"symbol": "diamond", "size": 14},
-                text=[fmt_money(r["Mid"])], textposition="middle right",
-                hovertemplate=f"{r['Method']}: {fmt_money(r['Mid'])}<extra></extra>",
+                text=[money(r["Mid"])],
+                textposition="middle right",
+                hovertemplate=f"{r['Method']}: {money(r['Mid'])}<extra></extra>",
                 showlegend=False,
             ))
-    if np.isfinite(price_val) and price_val > 0:
-        fig.add_vline(x=price_val, line_dash="dash", line_color="black",
-                      annotation_text=f"Market price {fmt_money(price_val)}", annotation_position="top")
-    fig.update_yaxes(categoryorder="array", categoryarray=method_names[::-1])
-    fig.update_layout(
-        title="Valuation football field: DCF range vs comparable valuation vs market price",
-        xaxis_title="Value per share (USD)", xaxis_tickprefix="$", yaxis_title="", bargap=0.4,
-    )
-    st.plotly_chart(fig, **STRETCH)
-    st.caption("Bars show low-to-high ranges (DCF: bear to bull; comps: 25th to 75th percentile peer multiple). "
-               "Diamonds are single-point estimates. The dashed line is the current market price.")
-else:
-    st.info("The football field will appear when at least one valuation method returns a valid value.")
 
-st.markdown("---")
-st.subheader("Key assumptions and limitations")
-st.markdown(
-    """
-    - Free cash flow is defined as operating cash flow minus capital expenditures; the base is the average of the latest three **available annual observations**.
-    - WACC uses CAPM cost of equity and market-value weights when market capitalization and debt are available.
-    - The DCF requires WACC to exceed perpetual growth.
-    - Bear and Bull cases shift FCF growth by 3 points, WACC by +1.5 / -1.0 points and terminal growth by -0.5 / +0.5 points (long-run growth capped at 3%).
-    - Comparable-company medians exclude missing, zero and negative trading multiples.
-    - Peer multiples and market prices are point-in-time market data and may change.
-    - Yahoo Finance data can contain missing or differently named line items; review the diagnostics and source statements.
-    - The assignment-defined CFO-minus-CapEx cash flow may not be equivalent to unlevered FCFF. This affects interpretation when discounted using WACC.
-    """
+    if np.isfinite(price) and price > 0:
+        football.add_vline(
+            x=price,
+            line_dash="dash",
+            line_color="black",
+            annotation_text=f"Market price {money(price)}",
+            annotation_position="top",
+        )
+
+    football.update_yaxes(categoryorder="array", categoryarray=method_names[::-1])
+    football.update_layout(
+        title=f"{ticker} valuation football field",
+        xaxis_title="Value per share (USD)",
+        xaxis_tickprefix="$",
+        yaxis_title="",
+        bargap=0.4,
+    )
+    show_chart(football)
+
+    st.caption(
+        "Bars show low-to-high ranges: DCF is Bear to Bull; comps use the 25th to 75th "
+        "percentile peer multiple; the 52-week range is the trading range. Diamonds are "
+        "single-point estimates. The dashed line is the current market price."
+    )
+else:
+    st.info("The football field appears once at least one valuation method returns a valid value.")
+
+
+# ============================================================
+# DISCLAIMER
+# ============================================================
+st.divider()
+
+st.caption(
+    "Educational use only, not investment advice. "
+    "Yahoo Finance data may be incomplete or delayed. "
+    "Check company filings and verify assumptions before relying "
+    "on any valuation."
 )
