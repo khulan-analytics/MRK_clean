@@ -1,71 +1,46 @@
-                )
-                row.append(result["intrinsic"] if result else np.nan)
-        values.append(row)
-
-    sensitivity = pd.DataFrame(
-        values,
-        index=[f"{x:.2%}" for x in wacc_grid],
-        columns=[f"{x:.2%}" for x in tg_grid],
-    )
-    sensitivity.index.name = "WACC"
-    sensitivity.columns.name = "Terminal growth"
-
-    st.dataframe(
-        sensitivity.style.format("${:,.2f}", na_rep="N/A").background_gradient(cmap="RdYlGn", axis=None),
-        use_container_width=True,
-    )
-
-    heat = go.Figure(data=go.Heatmap(
-        z=sensitivity.to_numpy(dtype=float),
-        x=sensitivity.columns.tolist(),
-        y=sensitivity.index.tolist(),
-        colorscale="RdYlGn",
-        colorbar={"title": "$ / share"},
-        hovertemplate="WACC: %{y}<br>Terminal growth: %{x}<br>Intrinsic value: $%{z:,.2f}<extra></extra>",
-    ))
-    heat.update_layout(
-        title="Intrinsic Value per Share — WACC vs Terminal Growth",
-        xaxis_title="Terminal growth",
-        yaxis_title="WACC",
-    )
-    st.plotly_chart(heat, use_container_width=True)
-
-    base_row = f"{selected_wacc:.2%}"
-    base_col = f"{terminal_growth:.2%}"
-    if base_row in sensitivity.index and base_col in sensitivity.columns:
-        st.success(f"Base-case grid value: {fmt_money(sensitivity.loc[base_row, base_col])} per share.")
-    valid = sensitivity.to_numpy(dtype=float)
-    valid = valid[np.isfinite(valid)]
-    if valid.size:
-        st.write(f"Across valid grid cells, estimated value ranges from {fmt_money(valid.min())} to {fmt_money(valid.max())} per share.")
-    st.write("**Interpretation:** Lower WACC increases present value; higher terminal growth increases terminal value. The model becomes especially sensitive when WACC approaches terminal growth.")
-else:
-    st.info("Sensitivity analysis requires valid base FCF, shares outstanding and WACC.")
-
-
 # ---------------------------------------------------------------------
 # PART 5 — EXTENSION: SCENARIOS + FOOTBALL FIELD
+# Drop-in replacement: paste over everything from the Part 5 header to the
+# end of the file. Uses names already defined earlier in your script:
+# base_fcf, fcf_growth, selected_wacc, terminal_growth, years, shares, price,
+# cash_assumption, debt_assumption, dcf, calculate_dcf, to_num, fmt_money,
+# and (optionally) comp_detail.
 # ---------------------------------------------------------------------
 st.header("Part 5 — Extension: Scenario Analysis and Valuation Football Field")
 st.write("Scenario assumptions are illustrative stress tests around the selected base case, not forecasts or investment recommendations.")
 
-scenario_rows = []
+price_val = to_num(price)
+
+
+def run_scenario(g, w, tg):
+    """DCF for one scenario; None if inputs are invalid (WACC must exceed terminal growth)."""
+    if not (np.isfinite(base_fcf) and np.isfinite(shares) and shares > 0 and w > tg):
+        return None
+    return calculate_dcf(base_fcf, g, tg, w, years, cash_assumption, debt_assumption, shares)
+
+
+# Bear/Bull keep WACC at least 1 pt above terminal growth so a scenario never
+# silently turns into N/A, and cap long-run growth at 3%.
+bear_tg = max(0.0, terminal_growth - 0.005)
+bull_tg = max(terminal_growth, min(terminal_growth + 0.005, 0.03))
 scenario_specs = [
-    ("Bear", fcf_growth - 0.03, selected_wacc + 0.015, max(0.0, terminal_growth - 0.005)),
+    ("Bear", fcf_growth - 0.03, selected_wacc + 0.015, bear_tg),
     ("Base", fcf_growth, selected_wacc, terminal_growth),
-    ("Bull", fcf_growth + 0.03, max(0.01, selected_wacc - 0.01), terminal_growth + 0.005),
+    ("Bull", fcf_growth + 0.03, max(selected_wacc - 0.01, bull_tg + 0.01), bull_tg),
 ]
+
+scenario_rows = []
 for name, g, w, tg in scenario_specs:
-    result = calculate_dcf(
-        base_fcf, g, tg, w, years,
-        cash_assumption, debt_assumption, shares
-    ) if np.isfinite(base_fcf) and np.isfinite(shares) and shares > 0 and tg < w else None
+    result = run_scenario(g, w, tg)
+    value = result["intrinsic"] if result else np.nan
+    has_price = np.isfinite(value) and np.isfinite(price_val) and price_val > 0
     scenario_rows.append({
         "Scenario": name,
         "FCF growth": g,
         "WACC": w,
         "Terminal growth": tg,
-        "Intrinsic value/share": result["intrinsic"] if result else np.nan,
+        "Intrinsic value/share": value,
+        "vs. market price": (value / price_val - 1) if has_price else np.nan,
     })
 
 scenario_df = pd.DataFrame(scenario_rows)
@@ -75,41 +50,88 @@ st.dataframe(
         "WACC": "{:.1%}",
         "Terminal growth": "{:.1%}",
         "Intrinsic value/share": "${:,.2f}",
+        "vs. market price": "{:+.1%}",
     }, na_rep="N/A"),
     use_container_width=True,
+    hide_index=True,
 )
 
-# Build football field from DCF base case and peer methods.
-football = []
-if dcf:
-    football.append({"Method": "DCF", "Value": dcf["intrinsic"]})
-if "comp_detail" in globals() and not comp_detail.empty:
-    for _, row in comp_detail.iterrows():
-        val = to_num(row.get("Implied value/share"))
-        if np.isfinite(val) and val > 0:
-            football.append({"Method": str(row["Method"]), "Value": val})
-if np.isfinite(price) and price > 0:
-    football.append({"Method": "Market price", "Value": price})
+scen_value = scenario_df.set_index("Scenario")["Intrinsic value/share"]
+base_value = scen_value.get("Base", np.nan)
+if dcf and np.isfinite(base_value) and abs(base_value - dcf["intrinsic"]) > 0.01:
+    st.warning("The Base scenario does not match the Part 2 DCF value. Check that both use the same inputs.")
 
-football_df = pd.DataFrame(football)
-if not football_df.empty:
+# ---------------------------------------------------------------------
+# Football field: horizontal RANGES per method, with the market price as a line
+# ---------------------------------------------------------------------
+field = []
+
+bear_v, bull_v = scen_value.get("Bear", np.nan), scen_value.get("Bull", np.nan)
+if np.isfinite(bear_v) and np.isfinite(bull_v):
+    field.append({
+        "Method": "DCF (bear to bull)",
+        "Low": min(bear_v, bull_v),
+        "High": max(bear_v, bull_v),
+        "Mid": base_value,
+    })
+
+comp_df = globals().get("comp_detail")
+if isinstance(comp_df, pd.DataFrame) and not comp_df.empty:
+    for _, row in comp_df.iterrows():
+        mid = to_num(row.get("Implied value/share"))
+        if not (np.isfinite(mid) and mid > 0):
+            continue
+        # Optional columns; if you do not compute peer low/high, a single point is drawn.
+        low = to_num(row.get("Low value/share"))
+        high = to_num(row.get("High value/share"))
+        if not (np.isfinite(low) and np.isfinite(high)):
+            low = high = mid
+        field.append({"Method": str(row["Method"]), "Low": low, "High": high, "Mid": mid})
+
+if field:
     st.subheader("Valuation football field")
+    methods = [r["Method"] for r in field]
     fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=football_df["Method"],
-        y=football_df["Value"],
-        text=[fmt_money(v) for v in football_df["Value"]],
-        textposition="outside",
-        name="Value per share",
-    ))
+    for r in field:
+        if r["High"] > r["Low"]:
+            fig.add_trace(go.Bar(
+                y=[r["Method"]],
+                x=[r["High"] - r["Low"]],
+                base=[r["Low"]],
+                orientation="h",
+                text=[f"{fmt_money(r['Low'])} – {fmt_money(r['High'])}"],
+                textposition="inside",
+                hovertemplate=(f"{r['Method']}<br>Low: {fmt_money(r['Low'])}"
+                               f"<br>High: {fmt_money(r['High'])}<extra></extra>"),
+                showlegend=False,
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=[r["Mid"]],
+                y=[r["Method"]],
+                mode="markers+text",
+                marker={"symbol": "diamond", "size": 14},
+                text=[fmt_money(r["Mid"])],
+                textposition="middle right",
+                hovertemplate=f"{r['Method']}: {fmt_money(r['Mid'])}<extra></extra>",
+                showlegend=False,
+            ))
+    if np.isfinite(price_val) and price_val > 0:
+        fig.add_vline(
+            x=price_val, line_dash="dash", line_color="black",
+            annotation_text=f"Market price {fmt_money(price_val)}",
+            annotation_position="top",
+        )
+    fig.update_yaxes(categoryorder="array", categoryarray=methods[::-1])
     fig.update_layout(
-        title="DCF vs Comparable Valuation vs Market Price",
-        xaxis_title="Valuation method",
-        yaxis_title="Value per share (USD)",
-        yaxis_tickprefix="$",
-        showlegend=False,
+        title="Valuation Football Field: DCF Range vs Comparable Valuation vs Market Price",
+        xaxis_title="Value per share (USD)",
+        xaxis_tickprefix="$",
+        yaxis_title="",
+        bargap=0.4,
     )
     st.plotly_chart(fig, use_container_width=True)
+    st.caption("Bars show low-to-high ranges; diamonds are single-point estimates (for example peer-median multiples); the dashed line is the current market price.")
 else:
     st.info("The football field will appear when at least one valuation method returns a valid value.")
 
@@ -120,6 +142,7 @@ st.markdown(
     - The three-year average uses the latest three **available annual FCF observations**.
     - WACC uses CAPM cost of equity and market-value weights when market capitalization and debt are available.
     - The DCF requires WACC to exceed perpetual growth.
+    - Bear and Bull cases shift FCF growth by 3 points, WACC by +1.5 / -1.0 points and terminal growth by -0.5 / +0.5 points (long-run growth capped at 3%).
     - Comparable-company medians exclude missing, zero and negative trading multiples.
     - Peer multiples and market prices are point-in-time market data and may change.
     - Yahoo Finance data can contain missing or differently named line items; review the diagnostics and source statements.
